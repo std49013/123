@@ -1,0 +1,232 @@
+import os
+import json
+from typing import List, Dict, Optional
+from pydantic import BaseModel, Field
+
+# หมายเหตุ: จำเป็นต้องเปิดใช้งาน openai package (pip install openai pydantic)
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+
+# ==========================================
+# Data Models
+# ==========================================
+
+class MicroTask(BaseModel):
+    id: str = Field(description="รหัสงานย่อย เช่น TASK-01")
+    title: str = Field(description="หัวข้อของงานย่อย")
+    description: str = Field(description="รายละเอียดสิ่งที่ต้องทำ")
+    required_skills: List[str] = Field(description="ทักษะที่จำเป็นในการทำสคริปต์/งานนี้")
+    estimated_hours: float = Field(description="เวลาที่คาดว่าจะใช้ (ชั่วโมง)")
+    priority: str = Field(description="ความสำคัญ: High, Medium, Low")
+
+class ProjectBreakdown(BaseModel):
+    project_name: str
+    tasks: List[MicroTask]
+
+class TeamMember(BaseModel):
+    member_id: str
+    name: str
+    skills: List[str]
+    available_hours: float
+    assigned_hours: float = 0.0
+
+class TaskAssignment(BaseModel):
+    task_id: str
+    task_title: str
+    assigned_to: Optional[str]
+    match_score: float
+    reason: str
+
+
+# ==========================================
+# Core Engine Classes
+# ==========================================
+
+class TaskDecomposer:
+    """ใช้ LLM ย่อยโปรเจกต์ขนาดใหญ่ให้เป็น Micro-tasks"""
+    
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if OpenAI and self.api_key:
+            self.client = OpenAI(api_key=self.api_key)
+        else:
+            self.client = None
+
+    def decompose(self, project_name: str, project_description: str) -> List[MicroTask]:
+        """ย่อยโปรเจกต์โดยคืนค่าเป็น List ของ MicroTask"""
+        if not self.client:
+            print("[Warning] API Key ไม่พบ/ไม่ได้ติดตั้ง openai module -> ใช้งาน Mock Mode")
+            return self._mock_decompose()
+
+        prompt = f"""
+        คุณคือ AI Project Manager ผู้เชี่ยวชาญในการทำ Task Breakdown Structure (TBS)
+        โปรดทำการย่อยโปรเจกต์ต่อไปนี้ให้เป็นงานย่อย (Micro-tasks) ที่มีขอบเขตชัดเจน สามารถทำเสร็จได้ในระยะเวลา short-term (1-8 ชั่วโมงต่อ task):
+
+        ชื่อโปรเจกต์: {project_name}
+        รายละเอียด: {project_description}
+        """
+
+        try:
+            response = self.client.beta.chat.completions.parse(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "คุณคือระบบวางแผนงานอัตโนมัติ ตอบกลับเฉพาะรูปแบบ JSON Schema ที่กำหนดเท่านั้น"},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format=ProjectBreakdown
+            )
+            parsed_data: ProjectBreakdown = response.choices[0].message.parsed
+            return parsed_data.tasks
+        except Exception as e:
+            print(f"[Error] การสื่อสารกับ LLM ล้มเหลว: {e}")
+            return self._mock_decompose()
+
+    def _mock_decompose(self) -> List[MicroTask]:
+        """ตัวอย่างข้อมูลจำลองกรณีไม่ได้เชื่อมต่อ API"""
+        return [
+            MicroTask(
+                id="TASK-01",
+                title="ออกแบบ DB Schema สำหรับระบบสมาชิก",
+                description="ออกแบบ ER-Diagram และเขียนไฟล์ Migration script",
+                required_skills=["Database", "SQL", "Backend"],
+                estimated_hours=4.0,
+                priority="High"
+            ),
+            MicroTask(
+                id="TASK-02",
+                title="พัฒนา REST API Authentication (JWT)",
+                description="เขียน Login/Register endpoint พร้อม Middleware ตรวจสอบ Token",
+                required_skills=["Python", "FastAPI", "Backend", "Security"],
+                estimated_hours=6.0,
+                priority="High"
+            ),
+            MicroTask(
+                id="TASK-03",
+                title="ออกแบบ UI Landing Page",
+                description="สร้าง Wireframe และ Design Token ใน Figma",
+                required_skills=["UI/UX", "Figma", "Frontend Design"],
+                estimated_hours=5.0,
+                priority="Medium"
+            ),
+            MicroTask(
+                id="TASK-04",
+                title="เขียน Frontend Component หน้า Login",
+                description="พัฒนา React Component ตามดีไซน์ Figma",
+                required_skills=["React", "Frontend", "TypeScript"],
+                estimated_hours=3.5,
+                priority="Medium"
+            )
+        ]
+
+
+class WorkloadAllocator:
+    """อัลกอริทึมจัดสรรงานอัตโนมัติโดยใช้ Skill Matching Score & Time Availability"""
+
+    def __init__(self, team_members: List[TeamMember]):
+        self.team = {m.member_id: m for m in team_members}
+
+    def _calculate_match_score(self, task: MicroTask, member: TeamMember) -> float:
+        """คำนวณคะแนนความเหมาะสม (0.0 - 1.0)"""
+        if not task.required_skills:
+            skill_score = 0.5
+        else:
+            # คำนวณอัตราส่วนทักษะที่ตรงกัน (Skill Match Ratio)
+            matched_skills = set(task.required_skills).intersection(set(member.skills))
+            skill_score = len(matched_skills) / len(task.required_skills)
+
+        # คำนวณภาระงานและเวลาคงเหลือ (Availability Score)
+        remaining_hours = member.available_hours - member.assigned_hours
+        if remaining_hours < task.estimated_hours:
+            availability_score = 0.0 # เวลาไม่พอ
+        else:
+            availability_score = remaining_hours / member.available_hours
+
+        # ถ่วงน้ำหนักคะแนน: ทักษะ 70%, เวลาคงเหลือ 30%
+        final_score = (skill_score * 0.7) + (availability_score * 0.3)
+        return final_score
+
+    def allocate_tasks(self, tasks: List[MicroTask]) -> List[TaskAssignment]:
+        assignments = []
+
+        # เรียงลำดับงานตามความสำคัญ (High -> Medium -> Low)
+        priority_weight = {"High": 3, "Medium": 2, "Low": 1}
+        sorted_tasks = sorted(tasks, key=lambda t: priority_weight.get(t.priority, 0), reverse=True)
+
+        for task in sorted_tasks:
+            best_candidate = None
+            highest_score = -1.0
+
+            for member_id, member in self.team.items():
+                score = self._calculate_match_score(task, member)
+                if score > highest_score and score > 0: # ต้องมีคะแนนมากกว่า 0 (ต้องมีเวลาพอ)
+                    highest_score = score
+                    best_candidate = member
+
+            if best_candidate and highest_score > 0.2: # Threshold ขั้นต่ำ
+                best_candidate.assigned_hours += task.estimated_hours
+                assignments.append(
+                    TaskAssignment(
+                        task_id=task.id,
+                        task_title=task.title,
+                        assigned_to=best_candidate.name,
+                        match_score=round(highest_score, 2),
+                        reason=f"ทักษะสอดคล้องและมีเวลาพอ (รับงานแล้วรวม {best_candidate.assigned_hours}/{best_candidate.available_hours} ชม.)"
+                    )
+                )
+            else:
+                assignments.append(
+                    TaskAssignment(
+                        task_id=task.id,
+                        task_title=task.title,
+                        assigned_to=None,
+                        match_score=0.0,
+                        reason="ไม่มีสมาชิกที่มีทักษะตรง หรือเวลาคงเหลือไม่เพียงพอ"
+                    )
+                )
+
+        return assignments
+
+
+# ==========================================
+# Execution / Demo Pipeline
+# ==========================================
+
+if __name__ == "__main__":
+    print("=== ระบบจัดและกระจายงานอัตโนมัติด้วย AI (AutoTask AI) ===")
+    
+    # 1. กำหนดข้อมูลทีมงานและเวลาว่างของแต่ละคน
+    team_members = [
+        TeamMember(member_id="M01", name="Alice (Backend Dev)", skills=["Python", "FastAPI", "SQL", "Database", "Security"], available_hours=12.0),
+        TeamMember(member_id="M02", name="Bob (Frontend Dev)", skills=["React", "TypeScript", "Frontend", "UI/UX"], available_hours=8.0),
+        TeamMember(member_id="M03", name="Charlie (UI Designer)", skills=["UI/UX", "Figma", "Frontend Design"], available_hours=10.0),
+    ]
+
+    # 2. ป้อนข้อมูลโปรเจกต์ขนาดใหญ่
+    project_title = "ระบบบริการลูกค้าสัมพันธ์อัจฉริยะ (Smart CRM Platform)"
+    project_desc = "พัฒนาแพลตฟอร์ม CRM สำหรับจัดการข้อมูลลูกค้า มีระบบยืนยันตัวตน RESTful API Dashboard แสดงผล และดีไซน์หน้าเว็บที่ใช้งานง่าย"
+
+    # 3. AI แตกโปรเจกต์เป็น Micro-tasks
+    decomposer = TaskDecomposer()
+    print(f"\n[1/2] AI กำลังวิเคราะห์และย่อยโปรเจกต์: '{project_title}'...")
+    micro_tasks = decomposer.decompose(project_title, project_desc)
+
+    print(f"-> ได้รับงานย่อยทั้งหมด {len(micro_tasks)} รายการ:")
+    for t in micro_tasks:
+        print(f"   - [{t.priority}] {t.id}: {t.title} ({t.estimated_hours} ชม.) | Skills: {', '.join(t.required_skills)}")
+
+    # 4. อัลกอริทึมคำนวณการจัดสรรงาน
+    print("\n[2/2] ระบบกำลังจัดสรรงานให้กับสมาชิกทีมตามความถนัดและเวลาว่าง...")
+    allocator = WorkloadAllocator(team_members)
+    results = allocator.allocate_tasks(micro_tasks)
+
+    # 5. แสดงผลลัพธ์
+    print("\n" + "="*70)
+    print(f"{'Task ID':<10} | {'งานที่มอบหมาย':<30} | {'ผู้รับผิดชอบ':<20} | {'Score'}")
+    print("="*70)
+    for res in results:
+        assignee = res.assigned_to if res.assigned_to else "❌ ยังไม่ระบุ (Unassigned)"
+        print(f"{res.task_id:<10} | {res.task_title:<30} | {assignee:<20} | {res.match_score}")
+    print("="*70)
